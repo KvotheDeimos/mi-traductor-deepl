@@ -5,59 +5,40 @@ import { HttpsProxyAgent } from 'https-proxy-agent';
 let proxyPool: string[] = [];
 let lastFetchTime = 0;
 
+// Usamos listas de proxies menos conocidas y más frescas
 const PROXY_SOURCES = [
-  'https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=ipport&format=text',
-  'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt',
-  'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt'
+  'https://raw.githubusercontent.com/themiralay/Proxy-List-World/master/data.txt',
+  'https://vakhov.github.io/fresh-proxy-list/http.txt',
+  'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt'
 ];
 
-// Movemos la función de traducción arriba para poder usarla en la validación
+// Nueva función usando la "puerta trasera" de DeepL (el endpoint de la app móvil)
 async function fetchDeepL(text: string, targetLang: string, proxyUrl: string) {
   const agent = new HttpsProxyAgent(proxyUrl);
-  const id = Math.floor(Math.random() * 100000) + 100000;
   
-  const postData = {
-    jsonrpc: "2.0",
-    method: "LMT_handle_texts",
-    params: {
-      texts: [{ text, requestAlternatives: 3 }],
-      splitting: "newlines",
-      lang: { source_lang_user_selected: "auto", target_lang: targetLang.toUpperCase() },
-      timestamp: Date.now()
-    },
-    id
+  const payload = {
+    text: [text],
+    target_lang: targetLang.toUpperCase(),
+    source_lang: "auto"
   };
-  
-  let postStr = JSON.stringify(postData);
-  const iCount = (text.match(/i/g) || []).length;
-  const timestamp = Date.now();
-  const adjustedTimestamp = timestamp - (timestamp % (iCount + 1)) + (iCount + 1);
-  postData.params.timestamp = adjustedTimestamp;
-  postStr = JSON.stringify(postData);
 
-  if ((id + 3) % 13 === 0 || (id + 5) % 29 === 0) {
-    postStr = postStr.replace('"method":"', '"method" : "');
-  } else {
-    postStr = postStr.replace('"method":"', '"method": "');
-  }
-
-  const response = await axios.post('https://www2.deepl.com/jsonrpc', postStr, {
+  const response = await axios.post('https://oneshot-free.www.deepl.com/v1/translate', payload, {
     httpsAgent: agent,
     headers: {
       'Content-Type': 'application/json',
-      'Accept': '*/*',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      'Authorization': 'None', // Header especial que usa la app
+      'User-Agent': 'DeepL/1.0 (iPhone; iOS 17.0; Scale/3.00)'
     },
-    timeout: 3500 // Tiempo de espera prudente
+    timeout: 4000 
   });
 
-  return response.data.result.texts[0].text;
+  return response.data.translations[0].text;
 }
 
 async function refreshProxies() {
   if (Date.now() - lastFetchTime < 10 * 60 * 1000 && proxyPool.length > 0) return;
 
-  console.log("[DEBUG] Descargando y validando proxies directamente contra DeepL...");
+  console.log("[DEBUG] Descargando y validando proxies con la puerta trasera de DeepL...");
   let rawProxies: string[] = [];
   
   for (const url of PROXY_SOURCES) {
@@ -68,28 +49,24 @@ async function refreshProxies() {
     } catch (e) {}
   }
 
-  // Tomamos 15 proxies al azar para no demorar una eternidad
+  // Probamos 15 al azar
   const shuffled = rawProxies.sort(() => 0.5 - Math.random()).slice(0, 15);
   const validProxies: string[] = [];
 
-  // 🔥 AQUÍ ESTÁ LA MAGIA: Probamos cada proxy haciendo una traducción real
   await Promise.allSettled(
     shuffled.map(async (p) => {
       const proxyUrl = `http://${p}`;
       try {
-        // Intentamos traducir "hello". Si funciona, el proxy es de oro.
+        // Probamos si el proxy logra traducir "hello" usando el endpoint permisivo
         await fetchDeepL("hello", "ES", proxyUrl);
         validProxies.push(proxyUrl);
-        console.log(`[DEBUG] Proxy ${proxyUrl} validado con éxito.`);
-      } catch (e: any) {
-        // Si falla por timeout o por bloqueo (429), lo ignoramos.
-      }
+      } catch (e: any) {}
     })
   );
 
   proxyPool = validProxies;
   lastFetchTime = Date.now();
-  console.log(`[DEBUG] Total proxies listos y probados con DeepL: ${proxyPool.length}`);
+  console.log(`[DEBUG] Proxies validados y listos: ${proxyPool.length}`);
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -108,26 +85,24 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     await refreshProxies();
     
     if (proxyPool.length === 0) {
-      throw new Error('Ningún proxy pudo ser validado contra DeepL. Intenta de nuevo.');
+      throw new Error('Ningún proxy sirvió. Intenta de nuevo.');
     }
 
     let lastError: any = null;
     
-    // Usamos los proxies que ya sabemos que funcionan
-    for (let attempt = 0; attempt < 3; attempt++) {
+    // Intentar traducir con los proxies que ya validamos
+    for (let attempt = 0; attempt < 5; attempt++) {
       const proxy = proxyPool[attempt % proxyPool.length];
-      console.log(`[DEBUG] Traduciendo texto real con proxy validado: ${proxy}`);
       
       try {
         const translation = await fetchDeepL(text, target_lang || 'ES', proxy);
         return res.status(200).json({ code: 200, data: translation });
       } catch (error: any) {
         lastError = error;
-        console.log(`[DEBUG] El proxy falló justo ahora (cosas de proxies gratis).`);
       }
     }
     
-    throw new Error(`Los proxies fallaron al final. Último error: ${lastError?.message}`);
+    throw new Error(`Proxies fallaron al final. Error: ${lastError?.message}`);
   } catch (error: any) {
     return res.status(500).json({ code: 500, message: error.message, data: null });
   }
