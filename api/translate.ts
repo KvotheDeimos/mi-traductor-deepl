@@ -11,42 +11,7 @@ const PROXY_SOURCES = [
   'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt'
 ];
 
-async function refreshProxies() {
-  if (Date.now() - lastFetchTime < 10 * 60 * 1000 && proxyPool.length > 0) return;
-
-  let rawProxies: string[] = [];
-  for (const url of PROXY_SOURCES) {
-    try {
-      const res = await axios.get(url, { timeout: 5000 });
-      const list = res.data.split('\n').map((p: string) => p.trim()).filter((p: string) => p.length > 0);
-      rawProxies = [...rawProxies, ...list];
-    } catch (e) {
-      console.warn(`Fallo al descargar de: ${url}`);
-    }
-  }
-
-  // Tomamos 10 proxies al azar para validar
-  const shuffled = rawProxies.sort(() => 0.5 - Math.random()).slice(0, 10);
-  const validProxies: string[] = [];
-
-  await Promise.allSettled(
-    shuffled.map(async (p) => {
-      const proxyUrl = `http://${p}`;
-      try {
-        const agent = new HttpsProxyAgent(proxyUrl);
-        // Validación estricta: 2.5 segundos máximo
-        await axios.get('http://httpbin.org/ip', { httpsAgent: agent, timeout: 2500 });
-        validProxies.push(proxyUrl);
-      } catch (e) {
-        // Proxy muerto, se ignora
-      }
-    })
-  );
-
-  proxyPool = validProxies;
-  lastFetchTime = Date.now();
-}
-
+// Movemos la función de traducción arriba para poder usarla en la validación
 async function fetchDeepL(text: string, targetLang: string, proxyUrl: string) {
   const agent = new HttpsProxyAgent(proxyUrl);
   const id = Math.floor(Math.random() * 100000) + 100000;
@@ -83,10 +48,48 @@ async function fetchDeepL(text: string, targetLang: string, proxyUrl: string) {
       'Accept': '*/*',
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     },
-    timeout: 4000 // Tiempo de espera más corto para no colgar la función
+    timeout: 3500 // Tiempo de espera prudente
   });
 
   return response.data.result.texts[0].text;
+}
+
+async function refreshProxies() {
+  if (Date.now() - lastFetchTime < 10 * 60 * 1000 && proxyPool.length > 0) return;
+
+  console.log("[DEBUG] Descargando y validando proxies directamente contra DeepL...");
+  let rawProxies: string[] = [];
+  
+  for (const url of PROXY_SOURCES) {
+    try {
+      const res = await axios.get(url, { timeout: 4000 });
+      const list = res.data.split('\n').map((p: string) => p.trim()).filter((p: string) => p.length > 0);
+      rawProxies = [...rawProxies, ...list];
+    } catch (e) {}
+  }
+
+  // Tomamos 15 proxies al azar para no demorar una eternidad
+  const shuffled = rawProxies.sort(() => 0.5 - Math.random()).slice(0, 15);
+  const validProxies: string[] = [];
+
+  // 🔥 AQUÍ ESTÁ LA MAGIA: Probamos cada proxy haciendo una traducción real
+  await Promise.allSettled(
+    shuffled.map(async (p) => {
+      const proxyUrl = `http://${p}`;
+      try {
+        // Intentamos traducir "hello". Si funciona, el proxy es de oro.
+        await fetchDeepL("hello", "ES", proxyUrl);
+        validProxies.push(proxyUrl);
+        console.log(`[DEBUG] Proxy ${proxyUrl} validado con éxito.`);
+      } catch (e: any) {
+        // Si falla por timeout o por bloqueo (429), lo ignoramos.
+      }
+    })
+  );
+
+  proxyPool = validProxies;
+  lastFetchTime = Date.now();
+  console.log(`[DEBUG] Total proxies listos y probados con DeepL: ${proxyPool.length}`);
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -105,27 +108,26 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     await refreshProxies();
     
     if (proxyPool.length === 0) {
-      throw new Error('No se pudo validar ningún proxy. Vuelve a intentar en unos segundos.');
+      throw new Error('Ningún proxy pudo ser validado contra DeepL. Intenta de nuevo.');
     }
 
     let lastError: any = null;
-    // AUMENTAMOS A 8 INTENTOS CON PROXIES DIFERENTES
-    for (let attempt = 0; attempt < 8; attempt++) {
-      // Evitamos repetir el mismo proxy si es posible
+    
+    // Usamos los proxies que ya sabemos que funcionan
+    for (let attempt = 0; attempt < 3; attempt++) {
       const proxy = proxyPool[attempt % proxyPool.length];
+      console.log(`[DEBUG] Traduciendo texto real con proxy validado: ${proxy}`);
       
       try {
         const translation = await fetchDeepL(text, target_lang || 'ES', proxy);
-        // Si llega aquí, el proxy funcionó y devolvemos la traducción
         return res.status(200).json({ code: 200, data: translation });
       } catch (error: any) {
         lastError = error;
-        console.warn(`Intento ${attempt + 1} fallido con proxy ${proxy}: ${error.message}`);
-        // El bucle continúa automáticamente al siguiente proxy
+        console.log(`[DEBUG] El proxy falló justo ahora (cosas de proxies gratis).`);
       }
     }
     
-    throw new Error(`Proxies agotados. Último error: ${lastError?.message}`);
+    throw new Error(`Los proxies fallaron al final. Último error: ${lastError?.message}`);
   } catch (error: any) {
     return res.status(500).json({ code: 500, message: error.message, data: null });
   }
