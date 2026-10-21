@@ -1,0 +1,12 @@
+{
+  "name": "traductor-deepl-backend",
+  "version": "1.0.0",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "https-proxy-agent": "^7.0.2"
+  },
+  "devDependencies": {
+    "@vercel/node": "^3.0.0",
+    "@types/node": "^20.0.0"
+  }
+}
