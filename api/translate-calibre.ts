@@ -8,6 +8,9 @@ const PROXY_SOURCES = [
   'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt'
 ];
 
+// 🔥 TU PROXY DE WEBSHARE (Confiable y rápido)
+const WEBSHARE_PROXY = 'http://ukbdqtiu:gzbd0doloqh0@p.webshare.io:80';
+
 let pool: string[] = [];
 let lastFetchTime = 0;
 
@@ -30,7 +33,7 @@ async function fetchDeepL(text: string, targetLang: string, proxyUrl: string) {
       'Authorization': 'None',
       'User-Agent': 'DeepL/1.0 (iPhone; iOS 17.0; Scale/3.00)'
     },
-    timeout: 2500 // 2.5s máximo para no hacer esperar a Calibre
+    timeout: 3000 // 3 segundos máximo
   });
 
   return response.data.translations[0].text;
@@ -44,13 +47,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   if (req.method === 'OPTIONS') return res.status(200).end();
   
-  // Aceptamos tanto "target" (Calibre) como "target_lang" (React) por si acaso
   const { text, target, target_lang } = req.body;
   const finalTarget = target || target_lang;
 
   if (!text) return res.status(400).json({ error: 'Falta el texto' });
 
   try {
+    // 🔥 1. INTENTAR CON WEBSHARE PRIMERO
+    try {
+      const translation = await fetchDeepL(text, finalTarget || 'ES', WEBSHARE_PROXY);
+      return res.status(200).json({ code: 200, data: translation });
+    } catch (e) {
+      console.log("Webshare falló, usando proxies gratuitos...");
+    }
+
+    // 2. SI WEBSHARE FALLA, USAR PROXIES GRATUITOS
     if (Date.now() - lastFetchTime > 5 * 60 * 1000 || pool.length === 0) {
       const results = await Promise.allSettled(PROXY_SOURCES.map(url => axios.get(url, { timeout: 3000 })));
       let rawProxies: string[] = [];
@@ -63,18 +74,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       lastFetchTime = Date.now();
     }
 
-    const proxiesToTry = pool.splice(0, 3); // Solo 3 intentos rápidos
+    const proxiesToTry = pool.splice(0, 3);
 
     for (const rawProxy of proxiesToTry) {
       try {
         const translation = await fetchDeepL(text, finalTarget || 'ES', `http://${rawProxy}`);
         return res.status(200).json({ code: 200, data: translation });
-      } catch (e) {
-        // Falla rápido y pasa al siguiente
-      }
+      } catch (e) {}
     }
 
-    // 🔥 SI FALLAN LOS 3: Devolvemos el texto original para que Calibre no llore
+    // 3. SI TODO FALLA, DEVOLVER ORIGINAL PARA NO ROMPER CALIBRE
     return res.status(200).json({ code: 200, data: text });
 
   } catch (error: any) {
