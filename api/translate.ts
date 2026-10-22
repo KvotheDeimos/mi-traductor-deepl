@@ -9,20 +9,13 @@ const PROXY_SOURCES = [
   'https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=ipport&format=text'
 ];
 
-const QUEUE_MAX_SIZE = 20;            
-const QUEUE_MIN_THRESHOLD = 5;        
-const MAX_USES_PER_PROXY = 5;         // 🔥 Límite conservador: 5 usos por proxy
-const TRANSLATION_TIMEOUT_MS = 12000; 
-
-interface ProxyState {
-  url: string;
-  uses: number; // Cuántas veces se ha usado este proxy
-}
-
-let eliteQueue: ProxyState[] = [];        
-let activeProxy: ProxyState | null = null; // El proxy que estamos usando actualmente
-let fillQueuePromise: Promise<void> | null = null; 
+let eliteQueue: string[] = [];        
+let pool: string[] = []; // Pool de respaldo para primera petición
+let isFillingQueue = false;           
 let lastFetchTime = 0;
+const QUEUE_MAX_SIZE = 15;            
+const QUEUE_MIN_THRESHOLD = 3;        
+const TRANSLATION_TIMEOUT_MS = 4000; // Bajo para responder rápido a Calibre
 
 async function fetchDeepL(text: string, targetLang: string, proxyUrl: string) {
   const agent = new HttpsProxyAgent(proxyUrl);
@@ -41,79 +34,45 @@ async function fetchDeepL(text: string, targetLang: string, proxyUrl: string) {
   return response.data.translations[0].text;
 }
 
-async function testProxyWithDeepL(proxyUrl: string): Promise<boolean> {
+// Llena la cola en segundo plano sin bloquear
+async function fillEliteQueue() {
+  if (isFillingQueue) return;
+  isFillingQueue = true;
   try {
-    await fetchDeepL('hello', 'ES', proxyUrl);
-    return true;
-  } catch (e) {
-    return false;
-  }
-}
-
-async function fillEliteQueue(): Promise<void> {
-  if (fillQueuePromise) return fillQueuePromise;
-
-  fillQueuePromise = (async () => {
-    console.log(`[Queue] Buscando proxies...`);
-    try {
+    if (Date.now() - lastFetchTime > 10 * 60 * 1000 || pool.length === 0) {
+      const results = await Promise.allSettled(PROXY_SOURCES.map(url => axios.get(url, { timeout: 5000 })));
       let rawProxies: string[] = [];
-      if (Date.now() - lastFetchTime > 10 * 60 * 1000 || eliteQueue.length === 0) {
-        const results = await Promise.allSettled(PROXY_SOURCES.map(url => axios.get(url, { timeout: 5000 })));
-        for (const res of results) {
-          if (res.status === 'fulfilled') {
-            const list = res.value.data.split('\n').map((p: string) => p.trim()).filter((p: string) => p.length > 0);
-            rawProxies = [...rawProxies, ...list];
-          }
-        }
-        lastFetchTime = Date.now();
-      }
-
-      const shuffled = rawProxies.sort(() => 0.5 - Math.random()).slice(0, 40);
-      const validProxies: string[] = [];
-
-      await Promise.allSettled(
-        shuffled.map(async (p) => {
-          const proxyUrl = `http://${p}`;
-          const isAlive = await testProxyWithDeepL(proxyUrl);
-          if (isAlive) validProxies.push(proxyUrl);
-        })
-      );
-
-      for (const p of validProxies) {
-        if (eliteQueue.length >= QUEUE_MAX_SIZE) break;
-        if (!eliteQueue.some(item => item.url === p)) {
-          eliteQueue.push({ url: p, uses: 0 });
+      for (const res of results) {
+        if (res.status === 'fulfilled') {
+          const list = res.value.data.split('\n').map((p: string) => p.trim()).filter((p: string) => p.length > 0);
+          rawProxies = [...rawProxies, ...list];
         }
       }
-      console.log(`[Queue] Proxies listos en cola: ${eliteQueue.length}`);
-    } catch (e) {
-      console.error("[Queue] Error:", e);
-    } finally {
-      fillQueuePromise = null;
+      pool = rawProxies.sort(() => 0.5 - Math.random()); // Mezclar el pool
+      lastFetchTime = Date.now();
     }
-  })();
 
-  return fillQueuePromise;
-}
+    // Validar en paralelo un lote de 20
+    const toValidate = pool.slice(0, 20);
+    const validProxies: string[] = [];
 
-// 🔥 Lógica del Proxy Pegajoso
-async function getStickyProxy(): Promise<string | null> {
-  // 1. Si no hay proxy activo, o ya llegó a su límite de 5 usos, tomamos uno nuevo
-  if (!activeProxy || activeProxy.uses >= MAX_USES_PER_PROXY) {
-    activeProxy = eliteQueue.shift() || null; // Sacamos uno de la cola
+    await Promise.allSettled(
+      toValidate.map(async (p) => {
+        const proxyUrl = `http://${p}`;
+        try {
+          await fetchDeepL('hello', 'ES', proxyUrl);
+          validProxies.push(proxyUrl);
+        } catch (e) {}
+      })
+    );
+
+    for (const p of validProxies) {
+      if (eliteQueue.length >= QUEUE_MAX_SIZE) break;
+      if (!eliteQueue.includes(p)) eliteQueue.push(p);
+    }
+  } finally {
+    isFillingQueue = false;
   }
-
-  // 2. Si la cola estaba vacía y no hay proxy activo, intentamos llenarla
-  if (!activeProxy) {
-    await fillEliteQueue();
-    activeProxy = eliteQueue.shift() || null;
-  }
-
-  if (!activeProxy) return null;
-
-  // 3. Sumamos un uso y devolvemos la URL
-  activeProxy.uses++;
-  return activeProxy.url;
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -125,44 +84,37 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method === 'OPTIONS') return res.status(200).end();
 
   if (req.method === 'GET') {
-    return res.status(200).json({ 
-      status: 'OK', 
-      proxies_en_cola: eliteQueue.length,
-      proxy_activo: activeProxy ? { url: activeProxy.url, usos: activeProxy.uses } : 'Ninguno'
-    });
+    return res.status(200).json({ status: 'OK', proxies_en_cola: eliteQueue.length });
   }
 
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Usa POST' });
+
   const { text, target_lang } = req.body;
-  if (!text) return res.status(400).json({ error: 'Falta el texto a traducir' });
+  if (!text) return res.status(400).json({ error: 'Falta el texto' });
 
   try {
-    let lastError: any = null;
-
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const proxy = await getStickyProxy();
-      if (!proxy) throw new Error('No hay proxies disponibles. Reintenta.');
-
-      try {
-        const translation = await fetchDeepL(text, target_lang || 'ES', proxy);
-        
-        if (eliteQueue.length < QUEUE_MIN_THRESHOLD) {
-          fillEliteQueue().catch(console.error);
-        }
-        res.setHeader('X-Proxies-En-Cola', eliteQueue.length.toString());
-        return res.status(200).json({ code: 200, data: translation });
-      } catch (error: any) {
-        lastError = error;
-        console.warn(`[Fallo] Proxy ${proxy} (Uso ${activeProxy?.uses}/${MAX_USES_PER_PROXY}): ${error.message}`);
-        
-        // 🔥 Si el proxy falla, lo descartamos inmediatamente y forzamos a que el próximo intento tome uno nuevo
-        activeProxy = null; 
-        
-        if (eliteQueue.length < QUEUE_MIN_THRESHOLD) {
-          fillEliteQueue().catch(console.error);
-        }
-      }
+    // Si no hay cola, disparamos el llenado en segundo plano para las siguientes
+    if (eliteQueue.length < QUEUE_MIN_THRESHOLD && !isFillingQueue) {
+      fillEliteQueue().catch(console.error);
     }
-    throw new Error(`Agotados los reintentos. Error: ${lastError?.message}`);
+
+    // Si la cola tiene proxies, usamos el primero
+    let proxyToUse = eliteQueue.shift() || null;
+
+    // Si no hay proxy en cola (es la primera petición de Calibre), usamos uno del pool directo
+    if (!proxyToUse && pool.length > 0) {
+      proxyToUse = `http://${pool[0]}`; // Usar el primero del pool
+      pool.shift(); // Quitarlo para no usarlo de nuevo si falla
+    }
+
+    if (!proxyToUse) {
+      throw new Error('No hay proxies disponibles en este momento. Reintenta en unos segundos.');
+    }
+
+    // Traducir con el proxy
+    const translation = await fetchDeepL(text, target_lang || 'ES', proxyToUse);
+    return res.status(200).json({ code: 200, data: translation });
+
   } catch (error: any) {
     return res.status(500).json({ code: 500, message: error.message, data: null });
   }
