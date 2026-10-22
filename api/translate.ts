@@ -8,13 +8,22 @@ const PROXY_SOURCES = [
   'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt'
 ];
 
-let pool: string[] = []; 
+let eliteQueue: string[] = [];
+let pool: string[] = [];
+let isFilling = false;
 let lastFetchTime = 0;
 
-async function fetchDeepL(text: string, targetLang: string, proxyUrl: string) {
-  // rejectUnauthorized: false evita el error de "CA certificate key too weak"
+function normalizeLang(lang: string): string {
+  if (!lang) return 'ES';
+  const l = lang.trim().toUpperCase();
+  if (l === 'SPANISH' || l === 'ES') return 'ES';
+  if (l === 'ENGLISH' || l === 'EN') return 'EN';
+  return l;
+}
+
+async function fetchDeepL(text: string, targetLang: string, proxyUrl: string, timeoutMs = 4000) {
   const agent = new HttpsProxyAgent(proxyUrl, { rejectUnauthorized: false });
-  const payload = { text: [text], target_lang: targetLang.toUpperCase(), source_lang: 'auto' };
+  const payload = { text: [text], target_lang: normalizeLang(targetLang), source_lang: 'auto' };
 
   const response = await axios.post('https://oneshot-free.www.deepl.com/v1/translate', payload, {
     httpsAgent: agent,
@@ -23,32 +32,48 @@ async function fetchDeepL(text: string, targetLang: string, proxyUrl: string) {
       'Authorization': 'None',
       'User-Agent': 'DeepL/1.0 (iPhone; iOS 17.0; Scale/3.00)'
     },
-    timeout: 2500 // 2.5 segundos máximo por proxy
+    timeout: timeoutMs
   });
 
   return response.data.translations[0].text;
 }
 
-async function fillPool() {
-  if (Date.now() - lastFetchTime > 5 * 60 * 1000 || pool.length === 0) {
-    try {
+async function fillEliteQueue() {
+  if (isFilling) return;
+  isFilling = true;
+  try {
+    if (Date.now() - lastFetchTime > 10 * 60 * 1000 || pool.length === 0) {
       const results = await Promise.allSettled(PROXY_SOURCES.map(url => axios.get(url, { timeout: 4000 })));
       let rawProxies: string[] = [];
       for (const res of results) {
         if (res.status === 'fulfilled') {
-          const list = res.value.data.split('\n').map((p: string) => p.trim()).filter((p: string) => p.length > 0);
+          const list = res.value.data.split('\n').map((p: string) => p.trim()).filter(Boolean);
           rawProxies = [...rawProxies, ...list];
         }
       }
-      // IMPORTANTE: Solo guardar proxies que empiecen con "http://" (evitar socks)
-      pool = rawProxies
-        .filter(p => !p.includes('socks') && !p.includes('https')) 
-        .sort(() => 0.5 - Math.random()); 
-      
+      pool = rawProxies.filter(p => !p.includes('socks')).sort(() => 0.5 - Math.random());
       lastFetchTime = Date.now();
-    } catch (e) {
-      console.error("Error llenando el pool:", e);
     }
+
+    const toValidate = pool.slice(0, 15);
+    const validProxies: string[] = [];
+
+    await Promise.allSettled(
+      toValidate.map(async (p) => {
+        const proxyUrl = `http://${p}`;
+        try {
+          await fetchDeepL('hello', 'ES', proxyUrl, 2500);
+          validProxies.push(proxyUrl);
+        } catch (e) {}
+      })
+    );
+
+    for (const p of validProxies) {
+      if (eliteQueue.length >= 15) break;
+      if (!eliteQueue.includes(p)) eliteQueue.push(p);
+    }
+  } finally {
+    isFilling = false;
   }
 }
 
@@ -59,37 +84,41 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
 
   if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Usa POST' });
 
   const { text, target_lang } = req.body;
   if (!text) return res.status(400).json({ error: 'Falta el texto' });
 
   try {
-    await fillPool();
-
-    if (pool.length === 0) {
-      // Si no hay proxies, devolvemos el texto original para que Calibre no explote
-      return res.status(200).json({ code: 200, data: text });
+    if (eliteQueue.length < 5 && !isFilling) {
+      fillEliteQueue().catch(console.error);
     }
 
-    // Tomamos los primeros 3 proxies del pool aleatorio
-    const proxiesToTry = pool.splice(0, 3);
+    let translation = null;
+    let lastError = null;
 
-    for (const rawProxy of proxiesToTry) {
-      const proxyToUse = `http://${rawProxy}`;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      let proxyToUse = eliteQueue.shift() || null;
+      if (!proxyToUse && pool.length > 0) {
+        proxyToUse = `http://${pool[0]}`; 
+        pool.shift(); 
+      }
+      if (!proxyToUse) break; 
+
       try {
-        const translation = await fetchDeepL(text, target_lang || 'ES', proxyToUse);
-        // Si funciona, devolvemos la traducción inmediatamente
-        return res.status(200).json({ code: 200, data: translation });
+        translation = await fetchDeepL(text, target_lang || 'ES', proxyToUse, 4000);
+        break;
       } catch (err: any) {
-        // Si falla, el bucle pasa al siguiente proxy silenciosamente
+        lastError = err;
       }
     }
 
-    // Si los 3 fallaron, devolvemos el texto original en lugar de un error
-    return res.status(200).json({ code: 200, data: text });
-
+    if (translation) {
+      return res.status(200).json({ code: 200, data: translation });
+    } else {
+      return res.status(500).json({ code: 500, message: 'No se pudo traducir tras 8 intentos.', data: null });
+    }
   } catch (error: any) {
-    // Fallback extremo para no romper Calibre
-    return res.status(200).json({ code: 200, data: text });
+    return res.status(500).json({ code: 500, message: error.message, data: null });
   }
 }
