@@ -1,8 +1,11 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import axios from 'axios';
 import { HttpsProxyAgent } from 'https-proxy-agent';
+import net from 'net';
 
-// Endpoints JSON-RPC oficiales y de extensiones
+// ==============================================================================
+// 1. ENDPOINTS Y FUENTES DE PROXIES
+// ==============================================================================
 const DEEPL_ENDPOINTS = [
   'https://www2.deepl.com/jsonrpc?client=chrome-extension,1.28.0',
   'https://www2.deepl.com/jsonrpc?client=edge-extension,1.3.0',
@@ -10,14 +13,25 @@ const DEEPL_ENDPOINTS = [
   'https://www2.deepl.com/jsonrpc?method=LMT_handle_jobs'
 ];
 
-// Fuente de proxies élite ya filtrados por latencia y anonimato
-const PROXYSCRAPE_ELITE =
-  'https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=1500&country=all&ssl=yes&anonymity=elite';
-const THESPEEDX_BACKUP =
-  'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt';
+const PROXY_SOURCES = [
+  'https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=1500&country=all&ssl=yes&anonymity=elite',
+  'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt',
+  'https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt'
+];
 
-let eliteQueue: string[] = [];
-let isFilling = false;
+// ==============================================================================
+// 2. POOLS EN MEMORIA VIVA (EMBUDO EN 3 CAPAS)
+// ==============================================================================
+// Capa 0: Lago masivo de IPs sin verificar
+let rawPool: { host: string; port: number }[] = [];
+
+// Capa 1: Warm Pool (Pre-Élite) -> Conectividad TCP comprobada en <450ms
+let warmPool: string[] = [];
+
+// Capa 2: Elite Pool -> Verificados directamente con DeepL JSON-RPC
+let elitePool: string[] = [];
+
+let isRefilling = false;
 let globalEndpointIndex = 0;
 
 function getNextEndpoint(): string {
@@ -26,7 +40,39 @@ function getNextEndpoint(): string {
   return ep;
 }
 
-// Algoritmo de timestamp y ID adaptativo de DeepL
+// ==============================================================================
+// 3. CAPA 1: PRE-FILTRO ULTRA-RÁPIDO POR TCP SOCKET (450ms)
+// Descarta servidores caídos o puertos cerrados SIN tocar DeepL
+// ==============================================================================
+function testTcpAlive(host: string, port: number, timeoutMs = 450): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const socket = new net.Socket();
+
+    const finish = (result: boolean) => {
+      if (!settled) {
+        settled = true;
+        socket.destroy();
+        resolve(result);
+      }
+    };
+
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => finish(true));
+    socket.once('timeout', () => finish(false));
+    socket.once('error', () => finish(false));
+
+    try {
+      socket.connect(port, host);
+    } catch {
+      finish(false);
+    }
+  });
+}
+
+// ==============================================================================
+// 4. ALGORITMO Y LLAMADA A DEEPL
+// ==============================================================================
 function getDeepLTimestamp(text: string): { timestamp: number; id: number } {
   const iCount = text.split('i').length - 1;
   const ts = Date.now();
@@ -104,18 +150,13 @@ async function fetchDeepL(
     transformRequest: [(data) => data]
   });
 
-  // 🔥 CORRECCIÓN CLAVE: Extraer TODAS las oraciones traducidas, no solo la primera
+  // 🔥 Extracción íntegra de TODOS los párrafos y oraciones
   const translations = response.data?.result?.translations;
   if (!translations || !Array.isArray(translations) || translations.length === 0) {
-    throw new Error('Respuesta DeepL sin resultado de traducción');
+    throw new Error('Respuesta DeepL sin traducciones');
   }
 
-  const beams = translations[0]?.beams;
-  if (!beams || !Array.isArray(beams) || beams.length === 0) {
-    throw new Error('Respuesta DeepL sin beams');
-  }
-
-  const sentences = beams[0]?.sentences;
+  const sentences = translations[0]?.beams?.[0]?.sentences;
   if (!sentences || !Array.isArray(sentences) || sentences.length === 0) {
     throw new Error('Respuesta DeepL sin oraciones');
   }
@@ -124,68 +165,92 @@ async function fetchDeepL(
     .map((s: any) => (typeof s?.text === 'string' ? s.text : ''))
     .join('');
 
-  if (!fullText.trim()) {
-    throw new Error('Traducción vacía de DeepL');
-  }
-
+  if (!fullText.trim()) throw new Error('Traducción vacía');
   return fullText;
 }
 
-// ⚡ Prevalidación ultrarrápida: prueba 12 candidatos de élite en paralelo
-async function quickFillEliteQueueFast() {
-  if (isFilling) return;
-  isFilling = true;
+// ==============================================================================
+// 5. MOTOR DE REFINAMIENTO EN CASCADA (LAGO -> WARM -> ELITE)
+// ==============================================================================
+async function ensurePoolsReady() {
+  if (isRefilling) return;
+  isRefilling = true;
 
   try {
-    let candidateIps: string[] = [];
+    // PASO A: Llenar el Lago Raw si está bajo de inventario
+    if (rawPool.length < 30) {
+      const results = await Promise.allSettled(
+        PROXY_SOURCES.map((url) => axios.get(url, { timeout: 2000 }))
+      );
 
-    // 1. Obtener candidatos de élite pre-filtrados
-    try {
-      const res = await axios.get(PROXYSCRAPE_ELITE, { timeout: 2000 });
-      if (typeof res?.data === 'string') {
-        candidateIps = res.data.split('\r\n').map((l) => l.trim()).filter(Boolean);
-      }
-    } catch (_) {}
-
-    // 2. Si ProxyScrape falló, respaldo rápido a TheSpeedX
-    if (candidateIps.length === 0) {
-      try {
-        const res = await axios.get(THESPEEDX_BACKUP, { timeout: 2000 });
-        if (typeof res?.data === 'string') {
-          candidateIps = res.data.split('\n').map((l) => l.trim()).filter(Boolean);
+      const parsedList: { host: string; port: number }[] = [];
+      for (const res of results) {
+        if (res.status === 'fulfilled' && typeof res.value.data === 'string') {
+          const lines = res.value.data.split(/[\r\n]+/);
+          for (const line of lines) {
+            const [host, portStr] = line.trim().split(':');
+            const port = parseInt(portStr, 10);
+            if (host && !isNaN(port) && port > 0) {
+              parsedList.push({ host, port });
+            }
+          }
         }
-      } catch (_) {}
+      }
+
+      // Desduplicar y mezclar aleatoriamente
+      const map = new Map<string, { host: string; port: number }>();
+      for (const item of parsedList) {
+        map.set(`${item.host}:${item.port}`, item);
+      }
+      rawPool = Array.from(map.values()).sort(() => Math.random() - 0.5);
     }
 
-    if (candidateIps.length === 0) return;
+    // PASO B: Filtrar Lago Raw hacia Warm Pool (Test TCP 450ms en bloque de 30)
+    if (warmPool.length < 15 && rawPool.length > 0) {
+      const candidates = rawPool.splice(0, 35);
+      const aliveProxies: string[] = [];
 
-    // 3. Tomar 12 candidatos aleatorios
-    const sample = candidateIps.sort(() => Math.random() - 0.5).slice(0, 12);
-    const validProxies: string[] = [];
-
-    // 4. Carrera paralela estricta de 1.5s: si un proxy no responde en 1500ms, se descarta
-    await Promise.allSettled(
-      sample.map(async (ipPort) => {
-        const proxyUrl = ipPort.startsWith('http') ? ipPort : `http://${ipPort}`;
-        try {
-          const testRes = await fetchDeepL('hello', 'ES', proxyUrl, 1500);
-          if (testRes && testRes.toLowerCase() !== 'hello') {
-            validProxies.push(proxyUrl);
+      await Promise.allSettled(
+        candidates.map(async (c) => {
+          const isAlive = await testTcpAlive(c.host, c.port, 450);
+          if (isAlive) {
+            aliveProxies.push(`http://${c.host}:${c.port}`);
           }
-        } catch (_) {
-          // Descarte inmediato sin esperas
-        }
-      })
-    );
+        })
+      );
 
-    if (validProxies.length > 0) {
-      eliteQueue = validProxies;
+      warmPool = [...warmPool, ...aliveProxies];
+    }
+
+    // PASO C: Filtrar Warm Pool hacia Elite Pool (Test DeepL en bloque de 8)
+    if (elitePool.length < 5 && warmPool.length > 0) {
+      const candidates = warmPool.splice(0, 8);
+      const verifiedElite: string[] = [];
+
+      await Promise.allSettled(
+        candidates.map(async (proxyUrl) => {
+          try {
+            // Test mínimo de 1.5s contra DeepL
+            const test = await fetchDeepL('hello', 'ES', proxyUrl, 1500);
+            if (test && test.toLowerCase() !== 'hello') {
+              verifiedElite.push(proxyUrl);
+            }
+          } catch (_) {
+            // Descarte silencioso si DeepL bloqueó esta IP
+          }
+        })
+      );
+
+      elitePool = [...elitePool, ...verifiedElite];
     }
   } finally {
-    isFilling = false;
+    isRefilling = false;
   }
 }
 
+// ==============================================================================
+// 6. HANDLER PRINCIPAL DE VERCEL
+// ==============================================================================
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -198,43 +263,45 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   if (!queryText) return res.status(400).json({ error: 'Falta el texto a traducir' });
 
-  // 1. INTENTO DIRECTO (Aprovecha las IPs limpias de Vercel: respuesta < 800ms)
+  // 1. INTENTO DIRECTO: Si la IP de Vercel está limpia, respuesta inmediata en <800ms
   try {
     const directResult = await fetchDeepL(queryText, toLang, null, 2500);
     if (directResult) {
       return res.status(200).json({ code: 200, data: directResult });
     }
-  } catch (directErr: any) {
-    // Si la IP directa de Vercel tiene rate-limit, pasamos a los proxies
+  } catch (_) {
+    // Si la IP de Vercel tiene rate-limit, pasamos al pool de proxies
   }
 
-  // 2. LLENADO RÁPIDO DE LA COLA SI ESTÁ VACÍA
-  if (eliteQueue.length === 0) {
-    await quickFillEliteQueueFast();
+  // 2. COMPROBACIÓN DEL EMBUDO: Asegurar que hay proxies en elitePool
+  if (elitePool.length < 2) {
+    await ensurePoolsReady();
   }
 
-  // 3. INTENTO CON LOS PROXIES DE ÉLITE YA VERIFICADOS
+  // 3. INTENTO CON ELITE POOL (Proxies pre-verificados)
   let attempts = 0;
   let lastError: any = null;
 
-  while (eliteQueue.length > 0 && attempts < 4) {
-    const proxy = eliteQueue.shift()!;
+  while (elitePool.length > 0 && attempts < 4) {
+    const proxy = elitePool.shift()!;
     attempts++;
     try {
       const translation = await fetchDeepL(queryText, toLang, proxy, 3500);
       if (translation && translation.toLowerCase() !== queryText.toLowerCase()) {
-        eliteQueue.push(proxy); // Reinsertar el proxy sano al final para reutilizarlo
+        // Éxito: reinsertar al final para seguir usándolo
+        elitePool.push(proxy);
         return res.status(200).json({ code: 200, data: translation });
       }
     } catch (err: any) {
       lastError = err;
-      // El proxy falló, no se reinserta en la cola
+      // Si falló, se descarta y se reabastece en segundo plano
+      ensurePoolsReady().catch(() => {});
     }
   }
 
   return res.status(502).json({
     code: 502,
-    message: `Fallo en DeepL: ${lastError?.message || 'Sin respuesta de proxies'}`,
+    message: `Fallo en DeepL: ${lastError?.message || 'Sin respuesta de proxies élite'}`,
     data: null
   });
 }
