@@ -2,7 +2,7 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 import axios from 'axios';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 
-// Endpoints funcionales de DeepL
+// Endpoints JSON-RPC oficiales y de extensiones
 const DEEPL_ENDPOINTS = [
   'https://www2.deepl.com/jsonrpc?client=chrome-extension,1.28.0',
   'https://www2.deepl.com/jsonrpc?client=edge-extension,1.3.0',
@@ -10,13 +10,11 @@ const DEEPL_ENDPOINTS = [
   'https://www2.deepl.com/jsonrpc?method=LMT_handle_jobs'
 ];
 
-// Si tienes proxy privado (Webshare, etc.), ponlo aquí o en la variable de entorno PRIORITY_PROXY en Vercel
-const PRIORITY_PROXY = process.env.PRIORITY_PROXY || 'http://ukbdqtiu:gzbd0doloqh0@p.webshare.io:80';
-
-const PROXY_SOURCES = [
-  'https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=ipport&format=json',
-  'https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt'
-];
+// Fuente de proxies élite ya filtrados por latencia y anonimato
+const PROXYSCRAPE_ELITE =
+  'https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=1500&country=all&ssl=yes&anonymity=elite';
+const THESPEEDX_BACKUP =
+  'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt';
 
 let eliteQueue: string[] = [];
 let isFilling = false;
@@ -28,7 +26,7 @@ function getNextEndpoint(): string {
   return ep;
 }
 
-// Algoritmo de timestamp adaptativo de DeepL
+// Algoritmo de timestamp y ID adaptativo de DeepL
 function getDeepLTimestamp(text: string): { timestamp: number; id: number } {
   const iCount = text.split('i').length - 1;
   const ts = Date.now();
@@ -49,7 +47,12 @@ function normalizeLang(lang: string): string {
   return l;
 }
 
-async function fetchDeepL(text: string, targetLang: string, proxyUrl: string | null, timeoutMs = 4000): Promise<string> {
+async function fetchDeepL(
+  text: string,
+  targetLang: string,
+  proxyUrl: string | null,
+  timeoutMs = 4000
+): Promise<string> {
   const endpoint = getNextEndpoint();
   const finalTargetLang = normalizeLang(targetLang);
   const { timestamp, id } = getDeepLTimestamp(text);
@@ -85,93 +88,98 @@ async function fetchDeepL(text: string, targetLang: string, proxyUrl: string | n
     jsonBody = jsonBody.replace('"method":', '"method": ');
   }
 
-  const agent = proxyUrl ? new HttpsProxyAgent(proxyUrl, { rejectUnauthorized: false, timeout: timeoutMs }) : undefined;
+  const agent = proxyUrl
+    ? new HttpsProxyAgent(proxyUrl, { rejectUnauthorized: false, timeout: timeoutMs })
+    : undefined;
 
   const response = await axios.post(endpoint, jsonBody, {
     httpsAgent: agent,
     headers: {
       'Content-Type': 'application/json',
-      'Accept': '*/*',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+      Accept: '*/*',
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
     },
     timeout: timeoutMs,
     transformRequest: [(data) => data]
   });
 
-  // 🔥 CORRECCIÓN CRÍTICA: Concatenar TODAS las oraciones devueltas (no solo la primera [0])
-  const translationObj = response.data?.result?.translations?.[0];
-  const sentences = translationObj?.beams?.[0]?.sentences || translationObj?.sentences;
+  // 🔥 CORRECCIÓN CLAVE: Extraer TODAS las oraciones traducidas, no solo la primera
+  const translations = response.data?.result?.translations;
+  if (!translations || !Array.isArray(translations) || translations.length === 0) {
+    throw new Error('Respuesta DeepL sin resultado de traducción');
+  }
 
+  const beams = translations[0]?.beams;
+  if (!beams || !Array.isArray(beams) || beams.length === 0) {
+    throw new Error('Respuesta DeepL sin beams');
+  }
+
+  const sentences = beams[0]?.sentences;
   if (!sentences || !Array.isArray(sentences) || sentences.length === 0) {
-    throw new Error('Respuesta DeepL sin traducción');
+    throw new Error('Respuesta DeepL sin oraciones');
   }
 
-  // Reconstruir el texto completo respetando prefijos/saltos de línea si existen
-  const fullTranslated = sentences
-    .map((s: any) => (s.prefix !== undefined ? s.prefix + s.text : s.text))
-    .join(sentences[0]?.prefix !== undefined ? '' : ' ')
-    .trim();
+  const fullText = sentences
+    .map((s: any) => (typeof s?.text === 'string' ? s.text : ''))
+    .join('');
 
-  if (!fullTranslated) {
-    throw new Error('Traducción devuelta vacía');
+  if (!fullText.trim()) {
+    throw new Error('Traducción vacía de DeepL');
   }
 
-  return fullTranslated;
+  return fullText;
 }
 
-function parseProxyList(data: any): { ip: string; port: number }[] {
-  const results: { ip: string; port: number }[] = [];
-  if (typeof data === 'string') {
-    const lines = data.split('\n');
-    for (const line of lines) {
-      const [host, portStr] = line.trim().split(':');
-      const port = parseInt(portStr, 10);
-      if (host && !isNaN(port) && port > 0) results.push({ ip: host, port });
-    }
-  } else if (Array.isArray(data)) {
-    for (const item of data) {
-      if (item.ip && item.port) results.push({ ip: item.ip, port: Number(item.port) });
-    }
-  }
-  return results;
-}
-
-async function quickFillEliteQueue() {
+// ⚡ Prevalidación ultrarrápida: prueba 12 candidatos de élite en paralelo
+async function quickFillEliteQueueFast() {
   if (isFilling) return;
   isFilling = true;
+
   try {
-    // Si hay proxy prioritario configurado, añadirlo de inmediato
-    if (PRIORITY_PROXY) {
-      eliteQueue = [PRIORITY_PROXY];
-      return;
-    }
+    let candidateIps: string[] = [];
 
-    const results = await Promise.allSettled(PROXY_SOURCES.map((url) => axios.get(url, { timeout: 2000 })));
-    let candidates: { ip: string; port: number }[] = [];
-    for (const res of results) {
-      if (res.status === 'fulfilled') {
-        candidates = [...candidates, ...parseProxyList(res.value.data)];
+    // 1. Obtener candidatos de élite pre-filtrados
+    try {
+      const res = await axios.get(PROXYSCRAPE_ELITE, { timeout: 2000 });
+      if (typeof res?.data === 'string') {
+        candidateIps = res.data.split('\r\n').map((l) => l.trim()).filter(Boolean);
       }
+    } catch (_) {}
+
+    // 2. Si ProxyScrape falló, respaldo rápido a TheSpeedX
+    if (candidateIps.length === 0) {
+      try {
+        const res = await axios.get(THESPEEDX_BACKUP, { timeout: 2000 });
+        if (typeof res?.data === 'string') {
+          candidateIps = res.data.split('\n').map((l) => l.trim()).filter(Boolean);
+        }
+      } catch (_) {}
     }
 
-    // Probar rápido solo los primeros 12 candidatos con timeout ágil (1.8s)
-    const testList = candidates.slice(0, 12);
-    const valid: string[] = [];
+    if (candidateIps.length === 0) return;
 
+    // 3. Tomar 12 candidatos aleatorios
+    const sample = candidateIps.sort(() => Math.random() - 0.5).slice(0, 12);
+    const validProxies: string[] = [];
+
+    // 4. Carrera paralela estricta de 1.5s: si un proxy no responde en 1500ms, se descarta
     await Promise.allSettled(
-      testList.map(async (p) => {
-        const url = `http://${p.ip}:${p.port}`;
+      sample.map(async (ipPort) => {
+        const proxyUrl = ipPort.startsWith('http') ? ipPort : `http://${ipPort}`;
         try {
-          const res = await fetchDeepL('hello', 'ES', url, 1800);
-          if (res && res.toLowerCase() !== 'hello') {
-            valid.push(url);
+          const testRes = await fetchDeepL('hello', 'ES', proxyUrl, 1500);
+          if (testRes && testRes.toLowerCase() !== 'hello') {
+            validProxies.push(proxyUrl);
           }
-        } catch (_) {}
+        } catch (_) {
+          // Descarte inmediato sin esperas
+        }
       })
     );
 
-    if (valid.length > 0) {
-      eliteQueue = valid;
+    if (validProxies.length > 0) {
+      eliteQueue = validProxies;
     }
   } finally {
     isFilling = false;
@@ -188,47 +196,39 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const queryText = (text || '').trim();
   const toLang = target_lang || targetLang || 'ES';
 
-  if (!queryText) return res.status(400).json({ error: 'Falta el texto' });
+  if (!queryText) return res.status(400).json({ error: 'Falta el texto a traducir' });
 
-  // 1. INTENTO PRIORITARIO: Si hay proxy privado configurado, usarlo directamente
-  if (PRIORITY_PROXY) {
-    try {
-      const result = await fetchDeepL(queryText, toLang, PRIORITY_PROXY, 5000);
-      if (result) {
-        return res.status(200).json({ code: 200, data: result });
-      }
-    } catch (err: any) {
-      // Si el prioritario falla, continúa al fallback
-    }
-  }
-
-  // 2. INTENTO DIRECTO (sin proxy) - Aprovecha IPs limpias de Vercel
+  // 1. INTENTO DIRECTO (Aprovecha las IPs limpias de Vercel: respuesta < 800ms)
   try {
     const directResult = await fetchDeepL(queryText, toLang, null, 2500);
     if (directResult) {
       return res.status(200).json({ code: 200, data: directResult });
     }
-  } catch (directErr: any) {}
-
-  // 3. INTENTO CON COLA DE ÉLITE
-  if (eliteQueue.length === 0) {
-    await quickFillEliteQueue();
+  } catch (directErr: any) {
+    // Si la IP directa de Vercel tiene rate-limit, pasamos a los proxies
   }
 
+  // 2. LLENADO RÁPIDO DE LA COLA SI ESTÁ VACÍA
+  if (eliteQueue.length === 0) {
+    await quickFillEliteQueueFast();
+  }
+
+  // 3. INTENTO CON LOS PROXIES DE ÉLITE YA VERIFICADOS
   let attempts = 0;
   let lastError: any = null;
 
-  while (eliteQueue.length > 0 && attempts < 3) {
+  while (eliteQueue.length > 0 && attempts < 4) {
     const proxy = eliteQueue.shift()!;
     attempts++;
     try {
-      const translation = await fetchDeepL(queryText, toLang, proxy, 3000);
+      const translation = await fetchDeepL(queryText, toLang, proxy, 3500);
       if (translation && translation.toLowerCase() !== queryText.toLowerCase()) {
-        eliteQueue.push(proxy);
+        eliteQueue.push(proxy); // Reinsertar el proxy sano al final para reutilizarlo
         return res.status(200).json({ code: 200, data: translation });
       }
     } catch (err: any) {
       lastError = err;
+      // El proxy falló, no se reinserta en la cola
     }
   }
 
