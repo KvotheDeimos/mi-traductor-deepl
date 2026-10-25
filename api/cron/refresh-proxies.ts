@@ -1,15 +1,12 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import axios from 'axios';
 import { HttpsProxyAgent } from 'https-proxy-agent';
-import { createClient } from '@supabase/supabase-js';
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://wvznuhohgqruoclffghr.supabase.co';
 const SUPABASE_KEY = process.env.SUPABASE_KEY || 'sb_publishable_jteTR9TTo0xWMZK1gwddLQ_YME5EQ8D';
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-
 const DEEPL_ENDPOINT = 'https://www2.deepl.com/jsonrpc?client=chrome-extension,1.28.0';
 
-// Formato de payload con evasión anti-bot requerida por DeepL
+// Formato y firma JSON-RPC requerida por DeepL para no devolver 429/error de sintaxis
 function formatDeepLPayload(text: string, targetLang: string) {
   const ts = Date.now();
   const id = (Math.floor(Math.random() * 99999) + 100000) * 1000;
@@ -19,6 +16,8 @@ function formatDeepLPayload(text: string, targetLang: string) {
     params: {
       jobs: [{ kind: 'default', sentences: [{ text, id: 1, prefix: '' }], raw_en_context_before: [], raw_en_context_after: [] }],
       lang: { target_lang: targetLang },
+      priority: 1,
+      commonJobParams: { mode: 'translate', textType: 'plaintext' },
       timestamp: ts,
     },
     id,
@@ -39,7 +38,7 @@ async function testProxyWithDeepL(proxyUrl: string, timeoutMs = 3500): Promise<{
     const body = formatDeepLPayload('hello', 'ES');
     const res = await axios.post(DEEPL_ENDPOINT, body, {
       httpsAgent: agent,
-      proxy: false,
+      proxy: false, // Requerido para evitar conflictos de túnel en Axios
       timeout: timeoutMs,
       headers: {
         'Content-Type': 'application/json',
@@ -47,7 +46,6 @@ async function testProxyWithDeepL(proxyUrl: string, timeoutMs = 3500): Promise<{
       },
     });
 
-    // 429 de DeepL significa que el túnel funciona y conectó con éxito con DeepL
     if (res.status === 429) {
       return { ok: true, latency: Date.now() - t0 };
     }
@@ -61,7 +59,7 @@ async function testProxyWithDeepL(proxyUrl: string, timeoutMs = 3500): Promise<{
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
-    // 1. Obtener candidatos frescos de listas públicas de alta disponibilidad
+    // 1. Descarga lista fresca de proxies HTTP
     const sourceRes = await axios.get(
       'https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=3000&country=all&ssl=all&anonymity=all',
       { timeout: 4000 }
@@ -74,7 +72,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       .sort(() => 0.5 - Math.random())
       .slice(0, 20);
 
-    // 2. Validar 20 proxies EN PARALELO (se completa en ~3.5s)
+    // 2. Probar los 20 proxies EN PARALELO (se completa en ~3.5s)
     const testResults = await Promise.allSettled(
       candidates.map(async (ipPort: string) => {
         const proxyUrl = `http://${ipPort}`;
@@ -95,16 +93,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
-    // 3. Guardar en Supabase
+    // 3. Guardar en Supabase usando REST nativo (cero dependencias externas)
     let savedCount = 0;
     if (validProxies.length > 0) {
-      const { data, error } = await supabase
-        .from('deepl_proxies')
-        .upsert(validProxies, { onConflict: 'url' })
-        .select();
+      const sbRes = await fetch(`${SUPABASE_URL}/rest/v1/deepl_proxies`, {
+        method: 'POST',
+        headers: {
+          apikey: SUPABASE_KEY,
+          Authorization: `Bearer ${SUPABASE_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'resolution=merge-duplicates,return=representation',
+        },
+        body: JSON.stringify(validProxies),
+      });
 
-      if (!error && data) {
-        savedCount = data.length;
+      if (sbRes.ok) {
+        const savedData = await sbRes.json();
+        savedCount = Array.isArray(savedData) ? savedData.length : validProxies.length;
       }
     }
 
