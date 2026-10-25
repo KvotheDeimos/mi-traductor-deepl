@@ -4,11 +4,8 @@ import { HttpsProxyAgent } from 'https-proxy-agent';
 import net from 'net';
 
 // ==============================================================================
-// 1. CREDENCIALES SUPABASE Y CONFIGURACIÓN
+// 1. ENDPOINTS Y FUENTES DE PROXIES
 // ==============================================================================
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://wvznuhohgqruoclffghr.supabase.co';
-const SUPABASE_KEY = process.env.SUPABASE_KEY || 'sb_publishable_jteTR9TTo0xWMZK1gwddLQ_YME5EQ8D';
-
 const DEEPL_ENDPOINTS = [
   'https://www2.deepl.com/jsonrpc?client=chrome-extension,1.28.0',
   'https://www2.deepl.com/jsonrpc?client=edge-extension,1.3.0',
@@ -16,14 +13,26 @@ const DEEPL_ENDPOINTS = [
   'https://www2.deepl.com/jsonrpc?method=LMT_handle_jobs'
 ];
 
+const PROXYSCRAPE_ELITE =
+  'https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=1500&country=all&ssl=yes&anonymity=elite';
+const THESPEEDX_BACKUP =
+  'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt';
 const PROXY_SOURCES = [
   'https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=1500&country=all&ssl=yes&anonymity=elite',
   'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt',
   'https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt'
 ];
 
+// ==============================================================================
+// 2. POOLS EN MEMORIA VIVA
+// ==============================================================================
+let rawPool: { host: string; port: number }[] = [];
+let warmPool: string[] = [];
+let elitePool: string[] = [];
+let eliteQueue: string[] = [];
+let isFilling = false;
+let isRefilling = false;
 let globalEndpointIndex = 0;
-let isFeedingSupabase = false;
 
 function getNextEndpoint(): string {
   const ep = DEEPL_ENDPOINTS[globalEndpointIndex % DEEPL_ENDPOINTS.length];
@@ -32,77 +41,13 @@ function getNextEndpoint(): string {
 }
 
 // ==============================================================================
-// 2. COMUNICACIÓN RÁPIDA CON SUPABASE (REST NATIVO)
+// 3. CAPA 1: PRE-FILTRO ULTRA-RÁPIDO POR TCP SOCKET (450ms)
 // ==============================================================================
-
-// Lee los mejores proxies ordenados por latencia (~35ms)
-async function getProxiesFromSupabase(limit = 10): Promise<string[]> {
-  try {
-    const res = await axios.get(
-      `${SUPABASE_URL}/rest/v1/deepl_proxies?select=url,latency_ms&order=latency_ms.asc&limit=${limit}`,
-      {
-        headers: {
-          apikey: SUPABASE_KEY,
-          Authorization: `Bearer ${SUPABASE_KEY}`
-        },
-        timeout: 2500
-      }
-    );
-    if (Array.isArray(res.data)) {
-      return res.data.map((r: any) => r.url).filter((u: string) => u && u.startsWith('http'));
-    }
-  } catch (_) {}
-  return [];
-}
-
-// Guarda un lote de proxies verificados en Supabase
-async function saveProxiesToSupabase(proxies: { url: string; latency_ms: number }[]): Promise<void> {
-  if (!proxies.length) return;
-  try {
-    await axios.post(
-      `${SUPABASE_URL}/rest/v1/deepl_proxies`,
-      proxies.map(p => ({
-        url: p.url,
-        latency_ms: p.latency_ms,
-        last_verified: new Date().toISOString(),
-        status: 'active'
-      })),
-      {
-        headers: {
-          apikey: SUPABASE_KEY,
-          Authorization: `Bearer ${SUPABASE_KEY}`,
-          'Content-Type': 'application/json',
-          Prefer: 'resolution=merge-duplicates'
-        },
-        timeout: 3000
-      }
-    );
-  } catch (_) {}
-}
-
-// Elimina inmediatamente un proxy caído de Supabase
-async function removeDeadProxyFromSupabase(proxyUrl: string): Promise<void> {
-  try {
-    await axios.delete(
-      `${SUPABASE_URL}/rest/v1/deepl_proxies?url=eq.${encodeURIComponent(proxyUrl)}`,
-      {
-        headers: {
-          apikey: SUPABASE_KEY,
-          Authorization: `Bearer ${SUPABASE_KEY}`
-        },
-        timeout: 1500
-      }
-    );
-  } catch (_) {}
-}
-
-// ==============================================================================
-// 3. CAPA 1: PRE-FILTRO TCP SOCKET (400ms)
-// ==============================================================================
-function testTcpAlive(host: string, port: number, timeoutMs = 400): Promise<boolean> {
+function testTcpAlive(host: string, port: number, timeoutMs = 450): Promise<boolean> {
   return new Promise((resolve) => {
     let settled = false;
     const socket = new net.Socket();
+
     const finish = (result: boolean) => {
       if (!settled) {
         settled = true;
@@ -110,10 +55,12 @@ function testTcpAlive(host: string, port: number, timeoutMs = 400): Promise<bool
         resolve(result);
       }
     };
+
     socket.setTimeout(timeoutMs);
     socket.once('connect', () => finish(true));
     socket.once('timeout', () => finish(false));
     socket.once('error', () => finish(false));
+
     try {
       socket.connect(port, host);
     } catch {
@@ -123,7 +70,7 @@ function testTcpAlive(host: string, port: number, timeoutMs = 400): Promise<bool
 }
 
 // ==============================================================================
-// 4. LLAMADA A DEEPL (CON RECONSTRUCCIÓN COMPLETA DE PÁRRAFOS)
+// 4. ALGORITMO Y LLAMADA A DEEPL
 // ==============================================================================
 function getDeepLTimestamp(text: string): { timestamp: number; id: number } {
   const iCount = text.split('i').length - 1;
@@ -204,7 +151,12 @@ async function fetchDeepL(
 
   const translations = response.data?.result?.translations;
   if (!translations || !Array.isArray(translations) || translations.length === 0) {
-    throw new Error('Respuesta DeepL sin traducciones');
+    throw new Error('Respuesta DeepL sin resultado de traducción');
+  }
+
+  const beams = translations[0]?.beams;
+  if (!beams || !Array.isArray(beams) || beams.length === 0) {
+    throw new Error('Respuesta DeepL sin beams');
   }
 
   const sentences = translations[0]?.beams?.[0]?.sentences;
@@ -216,81 +168,76 @@ async function fetchDeepL(
     .map((s: any) => (typeof s?.text === 'string' ? s.text : ''))
     .join('');
 
-  if (!fullText.trim()) throw new Error('Traducción vacía');
+  if (!fullText.trim()) {
+    throw new Error('Traducción vacía de DeepL');
+  }
+
   return fullText;
 }
 
-// ==============================================================================
-// 5. MOTOR DE SEGUNDO PLANO: ALIMENTA SUPABASE SI QUEDAN POCOS PROXIES
-// ==============================================================================
-async function feedSupabaseInBackground() {
-  if (isFeedingSupabase) return;
-  isFeedingSupabase = true;
+// ⚡ Prevalidación ultrarrápida: prueba 12 candidatos de élite en paralelo
+async function quickFillEliteQueueFast() {
+  if (isFilling) return;
+  isFilling = true;
 
   try {
-    const results = await Promise.allSettled(
-      PROXY_SOURCES.map((url) => axios.get(url, { timeout: 2000 }))
-    );
+    let candidateIps: string[] = [];
 
-    const parsed: { host: string; port: number }[] = [];
-    for (const res of results) {
-      if (res.status === 'fulfilled' && typeof res.value.data === 'string') {
-        const lines = res.value.data.split(/[\r\n]+/);
-        for (const line of lines) {
-          const [host, portStr] = line.trim().split(':');
-          const port = parseInt(portStr, 10);
-          if (host && !isNaN(port) && port > 0) parsed.push({ host, port });
-        }
+    // 1. Obtener candidatos de élite pre-filtrados
+    try {
+      const res = await axios.get(PROXYSCRAPE_ELITE, { timeout: 2000 });
+      if (typeof res?.data === 'string') {
+        candidateIps = res.data.split('\r\n').map((l) => l.trim()).filter(Boolean);
       }
+    } catch (_) {}
+
+    // 2. Si ProxyScrape falló, respaldo rápido a TheSpeedX
+    if (candidateIps.length === 0) {
+      try {
+        const res = await axios.get(THESPEEDX_BACKUP, { timeout: 2000 });
+        if (typeof res?.data === 'string') {
+          candidateIps = res.data.split('\n').map((l) => l.trim()).filter(Boolean);
+        }
+      } catch (_) {}
     }
 
-    // Tomar 30 candidatos y pasar filtro TCP a 400ms
-    const sample = parsed.sort(() => Math.random() - 0.5).slice(0, 30);
-    const tcpAlive: string[] = [];
+    if (candidateIps.length === 0) return;
 
-    await Promise.allSettled(
-      sample.map(async (c) => {
-        const isAlive = await testTcpAlive(c.host, c.port, 400);
-        if (isAlive) tcpAlive.push(`http://${c.host}:${c.port}`);
-      })
-    );
+    // 3. Tomar 12 candidatos aleatorios
+    const sample = candidateIps.sort(() => Math.random() - 0.5).slice(0, 12);
+    const validProxies: string[] = [];
 
-    // Probar los 8 mejores con DeepL y guardarlos en Supabase
-    const verified: { url: string; latency_ms: number }[] = [];
+    // 4. Carrera paralela estricta de 1.5s: si un proxy no responde en 1500ms, se descarta
     await Promise.allSettled(
-      tcpAlive.slice(0, 8).map(async (proxyUrl) => {
-        const t0 = Date.now();
+      sample.map(async (ipPort) => {
+        const proxyUrl = ipPort.startsWith('http') ? ipPort : `http://${ipPort}`;
         try {
-          const test = await fetchDeepL('hello', 'ES', proxyUrl, 1800);
-          if (test && test.toLowerCase() !== 'hello') {
-            verified.push({ url: proxyUrl, latency_ms: Date.now() - t0 });
+          const testRes = await fetchDeepL('hello', 'ES', proxyUrl, 1500);
+          if (testRes && testRes.toLowerCase() !== 'hello') {
+            validProxies.push(proxyUrl);
           }
-        } catch (_) {}
+        } catch (_) {
+          // Descarte inmediato sin esperas
+        }
       })
     );
 
-    if (verified.length > 0) {
-      await saveProxiesToSupabase(verified);
+    if (validProxies.length > 0) {
+      eliteQueue = validProxies;
     }
   } finally {
-    isFeedingSupabase = false;
+    isFilling = false;
   }
 }
 
 // ==============================================================================
-// 6. HANDLER PRINCIPAL DE TRADUCCIÓN
+// 5. HANDLER PRINCIPAL DE VERCEL
 // ==============================================================================
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.status(200).end();
-
-  // Si entra por GET (o endpoint Cron), dispara alimentación de fondo y responde
-  if (req.method === 'GET') {
-    feedSupabaseInBackground().catch(() => {});
-    return res.status(200).json({ status: 'Feeder triggered' });
-  }
 
   const { text, target_lang, targetLang } = req.body || {};
   const queryText = (text || '').trim();
@@ -298,40 +245,43 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   if (!queryText) return res.status(400).json({ error: 'Falta el texto a traducir' });
 
-  // 1. INTENTO DIRECTO (Respuesta ultra-rápida si la IP de Vercel no está limitada)
+  // 1. INTENTO DIRECTO (Aprovecha las IPs limpias de Vercel: respuesta < 800ms)
   try {
     const directResult = await fetchDeepL(queryText, toLang, null, 2500);
     if (directResult) {
       return res.status(200).json({ code: 200, data: directResult });
     }
-  } catch (_) {}
-
-  // 2. CONSULTAR SUPABASE (~35ms): Obtiene los proxies más veloces ya listos
-  let proxies = await getProxiesFromSupabase(8);
-
-  // Si Supabase tiene pocos proxies (<3), dispara alimentación de fondo sin bloquear al usuario
-  if (proxies.length < 3) {
-    feedSupabaseInBackground().catch(() => {});
+  } catch (_) {
+    // Si la IP de Vercel tiene rate-limit, pasamos al pool de proxies
   }
 
-  // 3. TRADUCIR CON LOS PROXIES DE SUPABASE
+  // 2. LLENADO RÁPIDO DE LA COLA SI ESTÁ VACÍA
+  if (eliteQueue.length === 0) {
+    await quickFillEliteQueueFast();
+  }
+
+  // 3. INTENTO CON LOS PROXIES DE ÉLITE YA VERIFICADOS
+  let attempts = 0;
   let lastError: any = null;
-  for (const proxy of proxies) {
+
+  while (eliteQueue.length > 0 && attempts < 4) {
+    const proxy = eliteQueue.shift()!;
+    attempts++;
     try {
       const translation = await fetchDeepL(queryText, toLang, proxy, 3500);
       if (translation && translation.toLowerCase() !== queryText.toLowerCase()) {
+        eliteQueue.push(proxy); // Reinsertar el proxy sano al final para reutilizarlo
         return res.status(200).json({ code: 200, data: translation });
       }
     } catch (err: any) {
       lastError = err;
-      // Si el proxy falló o dio 429, eliminarlo de Supabase al instante
-      removeDeadProxyFromSupabase(proxy).catch(() => {});
+      // El proxy falló, no se reinserta en la cola
     }
   }
 
   return res.status(502).json({
     code: 502,
-    message: `Fallo en DeepL: ${lastError?.message || 'Sin proxies disponibles en Supabase'}`,
+    message: `Fallo en DeepL: ${lastError?.message || 'Sin respuesta de proxies'}`,
     data: null
   });
 }
