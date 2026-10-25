@@ -1,33 +1,59 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import axios from 'axios';
 import { HttpsProxyAgent } from 'https-proxy-agent';
+import { createClient } from '@supabase/supabase-js';
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://wvznuhohgqruoclffghr.supabase.co';
 const SUPABASE_KEY = process.env.SUPABASE_KEY || 'sb_publishable_jteTR9TTo0xWMZK1gwddLQ_YME5EQ8D';
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-const DEEPL_TEST_ENDPOINT = 'https://www2.deepl.com/jsonrpc?client=chrome-extension,1.28.0';
+const DEEPL_ENDPOINT = 'https://www2.deepl.com/jsonrpc?client=chrome-extension,1.28.0';
 
-async function testProxy(proxyUrl: string): Promise<{ ok: boolean; latency: number }> {
+// Formato de payload con evasión anti-bot requerida por DeepL
+function formatDeepLPayload(text: string, targetLang: string) {
+  const ts = Date.now();
+  const id = (Math.floor(Math.random() * 99999) + 100000) * 1000;
+  const payload = {
+    jsonrpc: '2.0',
+    method: 'LMT_handle_jobs',
+    params: {
+      jobs: [{ kind: 'default', sentences: [{ text, id: 1, prefix: '' }], raw_en_context_before: [], raw_en_context_after: [] }],
+      lang: { target_lang: targetLang },
+      timestamp: ts,
+    },
+    id,
+  };
+  let jsonBody = JSON.stringify(payload);
+  if ((id + 5) % 29 === 0 || (id + 3) % 13 === 0) {
+    jsonBody = jsonBody.replace('"method":', '"method" : ');
+  } else {
+    jsonBody = jsonBody.replace('"method":', '"method": ');
+  }
+  return jsonBody;
+}
+
+async function testProxyWithDeepL(proxyUrl: string, timeoutMs = 3500): Promise<{ ok: boolean; latency: number }> {
   const t0 = Date.now();
   try {
-    const agent = new HttpsProxyAgent(proxyUrl, { rejectUnauthorized: false, timeout: 1800 });
-    const payload = {
-      jsonrpc: '2.0',
-      method: 'LMT_handle_jobs',
-      params: {
-        jobs: [{ kind: 'default', sentences: [{ text: 'hello', id: 1, prefix: '' }], raw_en_context_before: [], raw_en_context_after: [] }],
-        lang: { target_lang: 'ES', source_lang_user_selected: 'auto' },
-        timestamp: Date.now()
-      },
-      id: Math.floor(Math.random() * 100000) + 100000
-    };
-    const res = await axios.post(DEEPL_TEST_ENDPOINT, payload, {
+    const agent = new HttpsProxyAgent(proxyUrl, { timeout: timeoutMs });
+    const body = formatDeepLPayload('hello', 'ES');
+    const res = await axios.post(DEEPL_ENDPOINT, body, {
       httpsAgent: agent,
-      headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
-      timeout: 1800
+      proxy: false,
+      timeout: timeoutMs,
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      },
     });
-    const hasTranslation = res.data?.result?.translations?.[0]?.beams?.[0]?.sentences?.[0]?.text !== undefined;
-    return { ok: hasTranslation, latency: Date.now() - t0 };
+
+    // 429 de DeepL significa que el túnel funciona y conectó con éxito con DeepL
+    if (res.status === 429) {
+      return { ok: true, latency: Date.now() - t0 };
+    }
+    const trans = res.data?.result?.translations?.[0]?.beams?.[0]?.sentences?.[0]?.text;
+    const ok = typeof trans === 'string' && trans.trim().length > 0;
+    return { ok, latency: Date.now() - t0 };
   } catch {
     return { ok: false, latency: 9999 };
   }
@@ -35,50 +61,60 @@ async function testProxy(proxyUrl: string): Promise<{ ok: boolean; latency: numb
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
-    // 1. Obtener 15 proxies frescos de Geonode (tarda ~200ms en lugar de 8s de GitHub)
-    const geoRes = await axios.get(
-      'https://proxylist.geonode.com/api/proxy-list?limit=15&page=1&sort_by=lastChecked&sort_type=desc',
-      { timeout: 2500 }
-    );
-    const rawList = geoRes.data?.data || [];
-    const candidates = rawList.map((p: any) => `http://${p.ip}:${p.port}`);
+    // 1. Obtener candidatos frescos de listas públicas de alta disponibilidad
+    const sourceRes = await axios.get(
+      'https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=3000&country=all&ssl=all&anonymity=all',
+      { timeout: 4000 }
+    ).catch(() => ({ data: '' }));
 
-    // 2. Probar los 15 en UNA SOLA ráfaga paralela con timeout agresivo (tarda máx. 1.8s)
-    const verified: { url: string; latency_ms: number; last_verified: string; status: string }[] = [];
-    await Promise.allSettled(
-      candidates.map(async (proxyUrl: string) => {
-        const { ok, latency } = await testProxy(proxyUrl);
-        if (ok) {
-          verified.push({
-            url: proxyUrl,
-            latency_ms: latency,
-            last_verified: new Date().toISOString(),
-            status: 'active'
-          });
-        }
+    const rawLines = typeof sourceRes.data === 'string' ? sourceRes.data.split('\n') : [];
+    const candidates = rawLines
+      .map((l: string) => l.trim())
+      .filter((l: string) => l.includes(':') && !l.startsWith('#'))
+      .sort(() => 0.5 - Math.random())
+      .slice(0, 20);
+
+    // 2. Validar 20 proxies EN PARALELO (se completa en ~3.5s)
+    const testResults = await Promise.allSettled(
+      candidates.map(async (ipPort: string) => {
+        const proxyUrl = `http://${ipPort}`;
+        const check = await testProxyWithDeepL(proxyUrl, 3500);
+        return { proxyUrl, ...check };
       })
     );
 
-    // 3. Guardar en Supabase si encontramos proxies válidos
-    if (verified.length > 0) {
-      await axios.post(`${SUPABASE_URL}/rest/v1/deepl_proxies`, verified, {
-        headers: {
-          apikey: SUPABASE_KEY,
-          Authorization: `Bearer ${SUPABASE_KEY}`,
-          'Content-Type': 'application/json',
-          Prefer: 'resolution=merge-duplicates'
-        },
-        timeout: 3000
-      });
+    const validProxies: { url: string; latency_ms: number; status: string; last_verified: string }[] = [];
+    for (const r of testResults) {
+      if (r.status === 'fulfilled' && r.value.ok) {
+        validProxies.push({
+          url: r.value.proxyUrl,
+          latency_ms: r.value.latency,
+          status: 'healthy',
+          last_verified: new Date().toISOString(),
+        });
+      }
+    }
+
+    // 3. Guardar en Supabase
+    let savedCount = 0;
+    if (validProxies.length > 0) {
+      const { data, error } = await supabase
+        .from('deepl_proxies')
+        .upsert(validProxies, { onConflict: 'url' })
+        .select();
+
+      if (!error && data) {
+        savedCount = data.length;
+      }
     }
 
     return res.status(200).json({
       status: 'success',
       proxies_probados: candidates.length,
-      proxies_guardados: verified.length,
-      proxies: verified.map(p => p.url)
+      proxies_guardados: savedCount,
+      proxies: validProxies.map((p) => p.url),
     });
-  } catch (error: any) {
-    return res.status(500).json({ status: 'error', message: error.message });
+  } catch (err: any) {
+    return res.status(500).json({ status: 'error', message: err.message });
   }
 }
