@@ -19,7 +19,7 @@ function getNextEndpoint(): string {
 }
 
 function getDeepLTimestamp(text: string): { timestamp: number; id: number } {
-  const iCount = text.split('i').length - 1;
+  const iCount = (text.match(/i/g) || []).length;
   const ts = Date.now();
   let timestamp = ts;
   if (iCount !== 0) {
@@ -30,7 +30,7 @@ function getDeepLTimestamp(text: string): { timestamp: number; id: number } {
   return { timestamp, id };
 }
 
-async function fetchDeepL(text: string, targetLang: string, proxyUrl: string | null, timeoutMs = 3500): Promise<string> {
+async function fetchDeepL(text: string, targetLang: string, proxyUrl: string | null, timeoutMs = 4000): Promise<string> {
   const endpoint = getNextEndpoint();
   const { timestamp, id } = getDeepLTimestamp(text);
 
@@ -38,8 +38,18 @@ async function fetchDeepL(text: string, targetLang: string, proxyUrl: string | n
     jsonrpc: '2.0',
     method: 'LMT_handle_jobs',
     params: {
-      jobs: [{ kind: 'default', sentences: [{ text, id: 1, prefix: '' }], raw_en_context_before: [], raw_en_context_after: [] }],
-      lang: { target_lang: targetLang.toUpperCase(), source_lang_user_selected: 'auto' },
+      jobs: [
+        {
+          kind: 'default',
+          sentences: [{ text, id: 1, prefix: '' }],
+          raw_en_context_before: [],
+          raw_en_context_after: []
+        }
+      ],
+      lang: {
+        target_lang: targetLang.toUpperCase(),
+        source_lang_user_selected: 'auto'
+      },
       priority: 1,
       commonJobParams: { mode: 'translate', textType: 'plaintext' },
       timestamp
@@ -48,29 +58,63 @@ async function fetchDeepL(text: string, targetLang: string, proxyUrl: string | n
   };
 
   let jsonBody = JSON.stringify(payload);
-  if ((id + 5) % 29 === 0 || (id + 3) % 13 === 0) jsonBody = jsonBody.replace('"method":', '"method" : ');
-  else jsonBody = jsonBody.replace('"method":', '"method": ');
+  if ((id + 5) % 29 === 0 || (id + 3) % 13 === 0) {
+    jsonBody = jsonBody.replace('"method":', '"method" : ');
+  } else {
+    jsonBody = jsonBody.replace('"method":', '"method": ');
+  }
 
-  const agent = proxyUrl ? new HttpsProxyAgent(proxyUrl, { rejectUnauthorized: false, timeout: timeoutMs }) : undefined;
+  const agent = proxyUrl
+    ? new HttpsProxyAgent(proxyUrl, {
+        rejectUnauthorized: false,
+        timeout: timeoutMs
+      })
+    : undefined;
 
   const response = await axios.post(endpoint, jsonBody, {
     httpsAgent: agent,
-    headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
+    proxy: false, // CRUCIAL en Node: evita colisiones de Axios con HttpsProxyAgent
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Origin': 'chrome-extension://jaocbbbihmflmeeigpidebfpmchcgcfg',
+      'Accept': '*/*',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Sec-Fetch-Dest': 'empty',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Site': 'none'
+    },
     timeout: timeoutMs,
     transformRequest: [(data) => data]
   });
 
   const translated = response.data?.result?.translations?.[0]?.beams?.[0]?.sentences?.[0]?.text;
-  if (!translated) throw new Error('Sin traducción devuelta por DeepL');
+  if (typeof translated !== 'string') {
+    throw new Error('Sin traducción devuelta por DeepL');
+  }
   return translated;
 }
 
-// Borrado asíncrono en Supabase si un proxy falla (fire-and-forget, no bloquea al usuario)
-function reportDeadProxyToSupabase(proxyUrl: string) {
-  axios.delete(`${SUPABASE_URL}/rest/v1/deepl_proxies?url=eq.${encodeURIComponent(proxyUrl)}`, {
-    headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
-    timeout: 3000
-  }).catch(() => {});
+// Borrado en Supabase SOLO si el proxy falló por red/429
+function reportDeadProxyToSupabase(proxyUrl: string, error?: any) {
+  const status = error?.response?.status;
+  const code = error?.code;
+  const isNetOrRateLimit =
+    status === 429 ||
+    status === 403 ||
+    status === 407 ||
+    code === 'ECONNABORTED' ||
+    code === 'ETIMEDOUT' ||
+    code === 'ECONNREFUSED';
+
+  if (!isNetOrRateLimit && error) return;
+
+  axios
+    .delete(`${SUPABASE_URL}/rest/v1/deepl_proxies?url=eq.${encodeURIComponent(proxyUrl)}`, {
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
+      timeout: 3000
+    })
+    .catch(() => {});
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -88,37 +132,43 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // 1. INTENTO DIRECTO RÁPIDO (<800ms)
   try {
     const direct = await fetchDeepL(queryText, toLang, null, 2500);
-    if (direct && direct.toLowerCase() !== queryText.toLowerCase()) {
+    if (typeof direct === 'string' && direct.length > 0) {
       return res.status(200).json({ code: 200, data: direct });
     }
-  } catch { /* Pasa a los proxies de Supabase */ }
+  } catch {
+    /* Pasa a los proxies de Supabase */
+  }
 
-  // 2. OBTENER PROXIES DE SUPABASE (~35ms de lectura)
+  // 2. OBTENER PROXIES DE SUPABASE (los más recientemente verificados y rápidos)
   let proxies: string[] = [];
   try {
-    const sRes = await axios.get(`${SUPABASE_URL}/rest/v1/deepl_proxies?select=url&order=latency_ms.asc&limit=10`, {
-      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
-      timeout: 2500
-    });
+    const sRes = await axios.get(
+      `${SUPABASE_URL}/rest/v1/deepl_proxies?select=url&order=last_verified.desc,latency_ms.asc&limit=15`,
+      {
+        headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
+        timeout: 2500
+      }
+    );
     if (Array.isArray(sRes.data)) {
       proxies = sRes.data.map((r: any) => r.url).filter(Boolean);
     }
   } catch {}
 
-  // 3. PROBAR HASTA 4 PROXIES CON BALANCEO ALEATORIO (Evita saturar siempre el mismo)
+  // 3. PROBAR HASTA 4 PROXIES CON BALANCEO ALEATORIO ENTRE LOS MEJORES
   let lastError: any = null;
   const shuffled = proxies.sort(() => 0.5 - Math.random());
 
   for (let i = 0; i < Math.min(4, shuffled.length); i++) {
     const proxy = shuffled[i];
     try {
-      const translation = await fetchDeepL(queryText, toLang, proxy, 3500);
-      if (translation && translation.toLowerCase() !== queryText.toLowerCase()) {
+      const translation = await fetchDeepL(queryText, toLang, proxy, 3800);
+      // Cualquier texto devuelto por DeepL es una traducción válida
+      if (typeof translation === 'string' && translation.length > 0) {
         return res.status(200).json({ code: 200, data: translation });
       }
     } catch (err: any) {
       lastError = err;
-      reportDeadProxyToSupabase(proxy); // Auto-limpieza en segundo plano
+      reportDeadProxyToSupabase(proxy, err);
     }
   }
 
